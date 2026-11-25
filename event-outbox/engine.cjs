@@ -1,0 +1,20 @@
+'use strict';
+const D = {
+  orders: [
+    { id: 'ORD-9100', amount: 12500, currency: 'RUB', status: 'awaiting_payment' },
+    { id: 'ORD-9101', amount: 13500, currency: 'RUB', status: 'paid' }
+  ],
+  statuses: {
+    awaiting_payment: 'Ожидает оплаты', payment_failed: 'Оплата не подтверждена',
+    paid: 'Оплачен', in_delivery: 'Передан в доставку', refunded: 'Возврат зафиксирован'
+  }
+};
+const clone = value => JSON.parse(JSON.stringify(value));
+const trace = (name, detail) => ({ name, detail, status: 'ok' });
+  function canonical(value){if(value===null||typeof value!=='object')return JSON.stringify(value);if(Array.isArray(value))return '['+value.map(canonical).join(',')+']';return '{'+Object.keys(value).sort().map(k=>JSON.stringify(k)+':'+canonical(value[k])).join(',')+'}';}
+  function initialState(){return {orders:clone(D.orders),events:[],outbox:[],leads:[]};}
+  function validateEvent(e){if(!e||typeof e!=='object'||Array.isArray(e))throw new Error('Неверное событие.');const allowed=['id','type','order_id','amount','currency'];if(Object.keys(e).some(k=>!allowed.includes(k)))throw new Error('Неизвестные поля события.');if(!/^[a-zA-Z0-9_-]{6,100}$/.test(e.id||''))throw new Error('Неверный идентификатор события.');if(!['payment.succeeded','payment.failed','refund.succeeded'].includes(e.type))throw new Error('Неизвестный тип события.');if(!/^ORD-\d{4}$/.test(e.order_id||''))throw new Error('Неверный заказ.');if(!Number.isSafeInteger(e.amount)||e.amount<=0)throw new Error('Сумма должна быть целым положительным числом в копейках.');if(e.currency!=='RUB')throw new Error('Поддерживается валюта RUB.');return e;}
+  function eventDecision(order,e){if(!order)throw new Error('Заказ не найден.');if(order.amount!==e.amount||order.currency!==e.currency)throw new Error('Сумма или валюта не совпадает с заказом.');if(e.type==='payment.succeeded'&&['awaiting_payment','payment_failed'].includes(order.status))return {status:'paid',effect:'order.paid',applied:true};if(e.type==='payment.failed'&&order.status==='awaiting_payment')return {status:'payment_failed',effect:null,applied:true};if(e.type==='refund.succeeded'&&order.status==='paid')return {status:'refunded',effect:'order.refunded',applied:true};return {status:order.status,effect:null,applied:false};}
+  function applyEvent(state,event){validateEvent(event);const fingerprint=canonical(event),existing=state.events.find(x=>x.id===event.id);if(existing){if(existing.fingerprint!==fingerprint)throw new Error('Событие с этим ID уже получено с другим содержимым.');return {duplicate:true,applied:false,order:clone(state.orders.find(o=>o.id===event.order_id)),trace:[trace('check_idempotency','Повтор: изменения не выполняются')]};}const order=state.orders.find(o=>o.id===event.order_id),decision=eventDecision(order,event);order.status=decision.status;state.events.push({...clone(event),fingerprint,applied:decision.applied});if(decision.effect&&!state.outbox.some(j=>j.key===order.id+':'+decision.effect))state.outbox.push({id:'JOB-'+String(state.outbox.length+1).padStart(4,'0'),key:order.id+':'+decision.effect,order_id:order.id,event:decision.effect,status:'queued',attempts:0,next_at:0});return {duplicate:false,applied:decision.applied,order:clone(order),trace:[trace('validate_contract','Тип, сумма и валюта проверены'),trace('check_idempotency','Первое получение события'),trace('change_order',decision.applied?D.statuses[decision.status]:'Текущее состояние сохранено'),trace('write_outbox',decision.effect?'Действие добавлено в очередь':'Дополнительное действие не требуется')]};}
+  function drainQueue(state,{failFirst=false,now=Date.now(),force=false}={}){const results=[];for(const job of state.outbox){if(job.status==='sent'||(!force&&job.next_at>now))continue;job.attempts++;if(failFirst&&job.attempts===1){job.status='retry';job.next_at=now+2000;job.last_error='Временная недоступность получателя';}else{job.status='sent';job.next_at=0;job.last_error=null;}results.push(clone(job));}return results;}
+module.exports = { initialState, applyEvent, drainQueue };
